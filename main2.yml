@@ -1,0 +1,133 @@
+---
+# Ansible playbook to check for Miniconda/Anaconda across multiple VMs
+# Generates three files:
+# 1. miniconda_vms.txt - List of VMs with Miniconda
+# 2. anaconda_vms.txt - List of VMs with Anaconda
+# 3. no_conda_vms.txt - List of VMs with neither
+
+- name: Check for Miniconda/Anaconda installations across VMs
+  hosts: targets
+  gather_facts: yes
+  vars:
+    conda_dirs:
+      - "{{ ansible_env.HOME }}/miniconda3"
+      - "{{ ansible_env.HOME }}/anaconda3"
+      - "{{ ansible_env.HOME }}/miniconda"
+      - "{{ ansible_env.HOME }}/anaconda"
+      - "/opt/miniconda3"
+      - "/opt/anaconda3"
+      - "/usr/local/miniconda3"
+      - "/usr/local/anaconda3"
+    output_dir: "./output"
+    miniconda_file: "{{ output_dir }}/miniconda_vms.txt"
+    anaconda_file: "{{ output_dir }}/anaconda_vms.txt"
+    no_conda_file: "{{ output_dir }}/no_conda_vms.txt"
+
+  tasks:
+    - name: Create output directory on control node
+      file:
+        path: "{{ output_dir }}"
+        state: directory
+      delegate_to: localhost
+      run_once: true
+
+    - name: Initialize output files on control node
+      file:
+        path: "{{ item }}"
+        state: touch
+      delegate_to: localhost
+      run_once: true
+      with_items:
+        - "{{ miniconda_file }}"
+        - "{{ anaconda_file }}"
+        - "{{ no_conda_file }}"
+
+    - name: Check if conda command exists
+      command: which conda
+      register: conda_command
+      changed_when: false
+      failed_when: false
+      ignore_errors: yes
+
+    - name: Check for conda in common installation directories
+      stat:
+        path: "{{ item }}/bin/conda"
+      register: conda_path_check
+      with_items: "{{ conda_dirs }}"
+      ignore_errors: yes
+
+    - name: Set facts about basic conda installation status
+      set_fact:
+        conda_installed: >-
+          {{ conda_command.rc == 0 or 
+             conda_path_check.results | selectattr('stat.exists', 'defined') | 
+             selectattr('stat.exists') | list | length > 0 }}
+
+    # Only run these tasks if conda is found
+    - name: Get conda info
+      command: conda info
+      register: conda_info
+      changed_when: false
+      failed_when: false
+      ignore_errors: yes
+      when: conda_installed
+
+    - name: Determine if Miniconda or Anaconda
+      set_fact:
+        is_miniconda: "{{ (conda_info.stdout is defined) and ('miniconda' in conda_info.stdout | lower) }}"
+        is_anaconda: "{{ (conda_info.stdout is defined) and ('anaconda' in conda_info.stdout | lower) }}"
+      when: conda_installed and conda_info.rc == 0
+      
+    - name: Debug conda info results
+      debug:
+        msg: >
+          Host: {{ inventory_hostname }},
+          Conda installed: {{ conda_installed }},
+          Identified as Miniconda: {{ is_miniconda | default(false) }},
+          Identified as Anaconda: {{ is_anaconda | default(false) }}
+      when: conda_installed
+
+    # If we couldn't determine specific type but conda is installed, classify as "no conda"
+    # No action needed as we'll only record specifically identified Miniconda/Anaconda
+
+    # Record results to appropriate files
+    - name: Record VMs with Miniconda
+      lineinfile:
+        path: "{{ miniconda_file }}"
+        line: "{{ inventory_hostname }}"
+      delegate_to: localhost
+      when: is_miniconda|default(false)
+
+    - name: Record VMs with Anaconda
+      lineinfile:
+        path: "{{ anaconda_file }}"
+        line: "{{ inventory_hostname }}"
+      delegate_to: localhost
+      when: is_anaconda|default(false)
+
+    - name: Record VMs with no conda
+      lineinfile:
+        path: "{{ no_conda_file }}"
+        line: "{{ inventory_hostname }}"
+      delegate_to: localhost
+      when: not conda_installed or (conda_installed and not is_miniconda|default(false) and not is_anaconda|default(false))
+
+- name: Generate summary report
+  hosts: localhost
+  tasks:
+    - name: Count entries in result files
+      shell: wc -l < {{ item }}
+      register: line_counts
+      with_items:
+        - "./output/miniconda_vms.txt"
+        - "./output/anaconda_vms.txt"
+        - "./output/no_conda_vms.txt"
+      changed_when: false
+
+    - name: Display summary
+      debug:
+        msg: |
+          Summary:
+          - VMs with Miniconda: {{ line_counts.results[0].stdout | trim }}
+          - VMs with Anaconda: {{ line_counts.results[1].stdout | trim }}
+          - VMs with no conda: {{ line_counts.results[2].stdout | trim }}
